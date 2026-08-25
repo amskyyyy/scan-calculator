@@ -1,0 +1,203 @@
+"""
+Camera + Manual Calculator
+---------------------------
+Two modes:
+  1. Camera Scan  -> Point your webcam at a printed/handwritten math problem
+                     (e.g. "12 + 5", "8 * 3 - 2"), it captures a frame,
+                     runs OCR (Tesseract) to read the text, and evaluates it.
+  2. Manual Mode  -> A normal calculator where you type numbers/operators.
+
+REQUIREMENTS (install before running):
+    pip install opencv-python pytesseract
+
+You ALSO need the Tesseract OCR *engine* itself (pytesseract is just a
+Python wrapper around it):
+    Windows: https://github.com/UB-Mannheim/tesseract/wiki  (installer)
+             then set TESSERACT_PATH below to the installed .exe
+    Mac:     brew install tesseract
+    Linux:   sudo apt install tesseract-ocr
+
+USAGE:
+    python camera_calculator.py
+"""
+
+import re
+import sys
+
+# ---- Optional imports (only needed for camera mode) ----
+try:
+    import cv2
+    import pytesseract
+    CAMERA_AVAILABLE = True
+except ImportError:
+    CAMERA_AVAILABLE = False
+
+if CAMERA_AVAILABLE:
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+# ---------------------------------------------------------------------------
+# Safe expression evaluator (used by both modes)
+# ---------------------------------------------------------------------------
+def safe_eval(expr: str):
+    """
+    Evaluates a basic arithmetic expression safely.
+    Supports + - * / // % ** ( )
+    Cleans up common OCR misreads (x -> *, ÷ -> /, etc.)
+    """
+    if not expr:
+        raise ValueError("Empty expression")
+
+    # Normalize common OCR / handwriting misreads
+    cleaned = expr.strip()
+    cleaned = cleaned.replace("x", "*").replace("X", "*")
+    cleaned = cleaned.replace("÷", "/")
+    cleaned = cleaned.replace("=", "")       # OCR sometimes reads trailing '='
+    cleaned = cleaned.replace(",", "")       # strip stray commas
+    cleaned = cleaned.replace(" ", "")
+
+    allowed_chars = set("0123456789.+-*/%()")
+    if not all(c in allowed_chars for c in cleaned):
+        raise ValueError(f"Unrecognized characters in: '{expr}' -> '{cleaned}'")
+
+    # Only allow digits/operators through eval, nothing else
+    return eval(cleaned, {"__builtins__": {}})
+
+
+# ---------------------------------------------------------------------------
+# Mode 1: Camera scan
+# ---------------------------------------------------------------------------
+def camera_scan_mode():
+    if not CAMERA_AVAILABLE:
+        print("\nCamera mode needs 'opencv-python' and 'pytesseract' installed.")
+        print("Run: pip install opencv-python pytesseract")
+        print("(and install the Tesseract OCR engine separately - see file header)\n")
+        return
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Could not access the camera.")
+        return
+
+    print("\nCamera scan mode")
+    print("  - Fit the math problem inside the GREEN box")
+    print("  - Press SPACE to capture and solve")
+    print("  - Press ESC to cancel\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame.")
+            break
+
+        box = get_roi_box(frame)
+        display = frame.copy()
+        x1, y1, x2, y2 = box
+        # Draw the green scanning box on the preview
+        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(display, "Fit problem in box, SPACE to scan", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        cv2.imshow("Scan math problem - SPACE to capture, ESC to cancel", display)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == 27:  # ESC
+            print("Cancelled.")
+            break
+
+        elif key == 32:  # SPACE
+            # Crop to only the region inside the green box before OCR
+            roi = frame[y1:y2, x1:x2]
+            text = extract_text_from_frame(roi)
+            print(f"OCR read: '{text}'")
+
+            try:
+                result = safe_eval(text)
+                print(f"Result: {result}\n")
+            except Exception as e:
+                print(f"Couldn't solve it ({e}). Try again with a clearer shot.\n")
+            # keep camera open so they can try again or ESC to exit
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def get_roi_box(frame, box_width=400, box_height=150):
+    """
+    Returns (x1, y1, x2, y2) for a box centered in the frame.
+    This is the only region that gets scanned - keeps the box a fixed
+    size/position so it's easy to line the problem up inside it.
+    """
+    h, w = frame.shape[:2]
+    box_width = min(box_width, w - 20)
+    box_height = min(box_height, h - 20)
+
+    x1 = (w - box_width) // 2
+    y1 = (h - box_height) // 2
+    x2 = x1 + box_width
+    y2 = y1 + box_height
+    return x1, y1, x2, y2
+
+
+def extract_text_from_frame(frame):
+    """Preprocess the (already-cropped) region and run OCR."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Improve contrast for OCR
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Whitelist characters so OCR doesn't guess random letters
+    custom_config = r'--psm 7 -c tessedit_char_whitelist=0123456789+-*/x.()='
+    raw_text = pytesseract.image_to_string(thresh, config=custom_config)
+
+    # Keep only relevant characters
+    cleaned = re.sub(r"[^0-9+\-*/x.() =]", "", raw_text)
+    return cleaned.strip()
+
+
+# ---------------------------------------------------------------------------
+# Mode 2: Manual calculator
+# ---------------------------------------------------------------------------
+def manual_mode():
+    print("\nManual calculator")
+    print("Type an expression like '12 + 5 * 2', or 'q' to go back.\n")
+
+    while True:
+        expr = input(">> ").strip()
+        if expr.lower() == 'q':
+            break
+        if not expr:
+            continue
+        try:
+            result = safe_eval(expr)
+            print(f"= {result}")
+        except Exception as e:
+            print(f"Error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Main menu
+# ---------------------------------------------------------------------------
+def main():
+    while True:
+        print("=" * 40)
+        print("  CALCULATOR")
+        print("=" * 40)
+        print("1. Scan a problem with the camera")
+        print("2. Use manual calculator")
+        print("3. Exit")
+
+        choice = input("Choose an option (1/2/3): ").strip()
+
+        if choice == '1':
+            camera_scan_mode()
+        elif choice == '2':
+            manual_mode()
+        elif choice == '3':
+            print("Goodbye!")
+            sys.exit(0)
+        else:
+            print("Invalid choice, try again.\n")
+
+
+if __name__ == "__main__":
+    main()
